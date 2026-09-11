@@ -1,25 +1,30 @@
-# Qwen 0.5B：LoRA 微调与评估
+# 第二步：Qwen 0.5B LoRA 微调与评估
 
-[返回路线总览](./README.md)。目标是在 4GB 显存上完成一轮有监督微调，而不是全参数训练 Qwen。
+[第一步：环境准备与从零预训练](./01-环境与预训练.md) · [第三步：PC 部署与手机扩展](./03-端侧部署.md)
 
-下面给出可保存成文件的完整教学示例，API 按指定版本编写；已做静态检查，不代表已在你的 Windows GPU 上执行。先做小步验收，再正式训练。
+目标是在本机 RTX 3050 Laptop 4GB 显存上完成一轮有监督微调，而不是全参数训练 Qwen。
+
+下面给出可保存成文件的完整教学示例，API 按指定版本编写；已做静态检查，不代表已在这张 GPU 上执行。普通 FP16 LoRA 仍是第一选择，因为依赖更简单；先以最大长度 128 做 10 步冒烟测试，通过后完成第一轮正式实验。只有实测显存不足，才引入 bitsandbytes QLoRA。
+
+开始前重新执行第一步的资源预检：系统可用内存建议至少约 6GiB，`nvidia-smi` 中不要留有 Ollama 或其他计算进程，笔记本接通电源并切到性能模式。本机虽然装有 Docker、存在 WSL 程序，但第一轮不使用它们，以免同时引入操作系统和容器变量。
 
 ## 1. 创建微调环境并下载模型
 
 新开 PowerShell。沿用上一篇的驱动与 GPU 验收条件，创建独立环境：
 
 ```powershell
-Set-Location D:\llm-lab
-py -3.12 -m venv .venv-finetune
+Set-Location D:\workspace\pretrain-model
+$PROJECT_ROOT = (Get-Location).Path
+py -3.12 -m venv .\.venv-finetune
 & .\.venv-finetune\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 python -m pip install transformers==4.56.2 peft==0.17.1 accelerate==1.10.1 datasets==4.0.0
 python -m pip check
-$env:HF_HOME = "D:\llm-lab\cache\huggingface"
-python D:\llm-lab\check_gpu.py
-New-Item -ItemType Directory -Force D:\llm-lab\finetune\data
-Set-Location D:\llm-lab\finetune
+$env:HF_HOME = Join-Path $PROJECT_ROOT "cache\huggingface"
+python .\check_gpu.py
+New-Item -ItemType Directory -Force .\finetune\data
+Set-Location .\finetune
 ```
 
 采用 [Transformers Trainer 4.56.2 文档](https://huggingface.co/docs/transformers/v4.56.2/en/trainer)对应的 API 和 [PEFT 0.17 系列的 LoRA 工作流](https://huggingface.co/docs/peft/v0.17.0/en/quicktour)。这些是教学版本基线，安装成功后再保存 `pip freeze`；不要把本章依赖装入 nanoGPT 环境。
@@ -30,12 +35,13 @@ Set-Location D:\llm-lab\finetune
 from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
 
+ROOT = Path(__file__).resolve().parents[1]
 repo = "Qwen/Qwen2.5-0.5B-Instruct"
 revision = HfApi().model_info(repo).sha
 snapshot_download(
     repo_id=repo,
     revision=revision,
-    local_dir=r"D:\llm-lab\models\qwen-base",
+    local_dir=ROOT / "models" / "qwen-base",
     allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"],
 )
 Path("base-revision.txt").write_text(f"{repo}\n{revision}\n", encoding="utf-8")
@@ -77,9 +83,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
+ROOT = Path(__file__).resolve().parents[1]
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=r"D:\llm-lab\models\qwen-base")
+    parser.add_argument("--model", default=str(ROOT / "models" / "qwen-base"))
     parser.add_argument("--adapter", default=None)
     parser.add_argument("--data", default="data/val.jsonl")
     parser.add_argument("--out", required=True)
@@ -100,7 +108,7 @@ def main():
         messages = [{"role": "user", "content": row["instruction"]}]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(text, add_special_tokens=False, return_tensors="pt").to("cuda")
-        assert inputs.input_ids.shape[1] <= 256, "第一轮请使用短输入，保持评估条件一致"
+        assert inputs.input_ids.shape[1] <= 128, "第一轮请使用短输入，保持评估条件一致"
         with torch.inference_mode():
             output = model.generate(**inputs, do_sample=False, max_new_tokens=48,
                                     pad_token_id=tokenizer.eos_token_id)
@@ -147,7 +155,8 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
-BASE = r"D:\llm-lab\models\qwen-base"
+ROOT = Path(__file__).resolve().parents[1]
+BASE = str(ROOT / "models" / "qwen-base")
 
 def read_rows(path):
     rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8-sig").splitlines() if line.strip()]
@@ -165,7 +174,7 @@ def main():
     parser.add_argument("--out", default="runs/lora-v1")
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--epochs", type=float, default=3)
-    parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
     assert torch.cuda.is_available()
@@ -253,12 +262,14 @@ LoRA 只加到 `q_proj`、`v_proj`，是为第一轮控制开销的选择，不�
 运行前用 `ollama ps` / `ollama stop 模型名` 卸载其他模型，结束上一次评估进程，然后执行：
 
 ```powershell
-python train_lora.py --max-steps 10 --out runs/smoke
-python train_lora.py --epochs 3 --out runs/lora-v1
+python train_lora.py --max-steps 10 --max-length 128 --out runs/smoke-128
+python train_lora.py --epochs 3 --max-length 128 --out runs/lora-v1
 python -m pip freeze > requirements-finetune-resolved.txt
 ```
 
-第一条成功的条件：loss 为有限数值、至少一次验证和保存、适配器文件存在、无显存错误。第二条为正式训练，使用全新输出目录，从基座重新开始，不会自动沿用 smoke 的权重。
+第一条成功的条件：loss 为有限数值、至少一次验证和保存、适配器文件存在、无显存错误。第二条为正式训练，使用全新输出目录，从基座重新开始，不会自动沿用 smoke 的权重。第一轮任务的答案很短，128 已足够；不要仅为追求更大的数字先升到 256。
+
+需要较长输入时，先单独运行 `python train_lora.py --max-steps 10 --max-length 256 --out runs/smoke-256`。只有这个冒烟测试通过，才用新的输出目录正式训练 256 长度，并分别记录峰值显存和步耗时。
 
 例如训练集 200 条，batch 1、梯度累积 8，每个 epoch 约 25 次优化器更新，3 个 epoch 约 75 步。数据迭代次数、micro-batch 数和 optimizer step 不是同一个概念。
 
@@ -292,7 +303,7 @@ python train_lora.py --epochs 3 --out runs/lora-v1 --resume runs/lora-v1/checkpo
 先确认 OOM 是加载时、前向/反向时还是评估时发生。`nvidia-smi` 可观察进程；PyTorch 打印的是自身 allocated/reserved 峰值，不包含所有驱动和其他应用显存。
 
 1. 停止 Ollama 已加载模型，关闭其他 GPU 程序，结束失败的训练进程再重跑。
-2. 本示例 batch 已为 1；将 `--max-length` 改为 128，同时缩短样本，确保完整答案保留。
+2. 本示例 batch 已为 1、第一轮长度已为 128；继续缩短输入和答案，但必须保留完整监督答案。仍不足就改用更小模型，不要把答案静默截断。
 3. 确认梯度检查点已开启、训练时 `use_cache=False`、评估只保留 loss。
 4. 仍不够，再尝试同一模型的 QLoRA，或更小模型；第一轮不要扩大到 1.5B/7B。
 
@@ -320,8 +331,10 @@ model = AutoModelForCausalLM.from_pretrained(
 model = prepare_model_for_kbit_training(model)
 ```
 
-运行 `python -m pip install bitsandbytes` 和 `python -m bitsandbytes` 检查环境，并保存实际安装版本。官方文档目前提供 Windows 支持，但具体 Python、PyTorch、CUDA 与 wheel 组合需要核对，不能沿用“Windows 一律不支持”的旧结论。参考 [bitsandbytes 安装说明](https://huggingface.co/docs/bitsandbytes/en/installation)和 [PEFT 量化指南](https://huggingface.co/docs/peft/en/developer_guides/quantization)。
+运行 `python -m pip install bitsandbytes` 和 `python -m bitsandbytes` 检查环境，并保存实际安装版本。官方文档目前为 Windows x86-64 提供包含 `sm86` 的 CUDA wheel，NF4/FP4 要求的计算能力也低于本机 8.6；因此硬件条件匹配，但具体 Python、PyTorch、CUDA runtime 与 wheel 组合仍必须实测，不能把“理论支持”写成“已经跑通”。参考 [bitsandbytes 安装说明](https://huggingface.co/docs/bitsandbytes/en/installation)和 [PEFT 量化指南](https://huggingface.co/docs/peft/en/developer_guides/quantization)。
 
 如果 Windows 上出现量化库兼容问题，先保留已经完成的普通 LoRA 小实验；需要时再单独迁移 WSL2。不要同时切换操作系统、模型和数据，否则难以定位问题。
 
 QLoRA 的合并同样从原始未量化基座加载 adapter，再进行合并、重新量化；量化训练和部署量化并非完全相同的数值路径，需要重新评估。
+
+保存 adapter、基座与微调后的同集评估结果后，进入[第三步：PC 部署与手机扩展](./03-端侧部署.md)。
