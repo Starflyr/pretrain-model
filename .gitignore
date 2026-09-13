@@ -1,0 +1,20 @@
+# Local Python environments and package/model caches
+.venv-pretrain/
+.venv-finetune/
+.venv-convert/
+.downloads/
+cache/
+
+# Downloaded upstream repositories and model artifacts
+nanoGPT/
+llama.cpp/
+models/
+ollama-models/
+tools/
+
+# Training outputs
+out-*/
+finetune/runs/
+__pycache__/
+*.pyc
+
